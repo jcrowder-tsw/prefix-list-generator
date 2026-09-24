@@ -46,7 +46,9 @@ def extract_func(name: str, **ns_extras):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             src = ast.get_source_segment(SRC, node)
             ns = dict(ns_extras)
-            exec(src, ns)
+            # app.py uses PEP 604 `X | None` annotations; defer their
+            # evaluation so the harness also runs on Python < 3.10.
+            exec("from __future__ import annotations\n" + src, ns)
             return ns[name]
     raise RuntimeError(f"function {name} not found in app.py")
 
@@ -293,10 +295,14 @@ def main() -> int:
     # Route table sanity — check the four expected route declarations are
     # present in app.py. Don't import Flask; just grep the source.
     expected_routes = [
-        '@app.route("/arista/as_set/<as_set>", defaults={"family": "ipv4"})',
-        '@app.route("/arista/as_set/<as_set>/v6", defaults={"family": "ipv6"})',
-        '@app.route("/arista/asn/<asn>", defaults={"family": "ipv4"})',
-        '@app.route("/arista/asn/<asn>/v6", defaults={"family": "ipv6"})',
+        '@app.route("/arista/as_set/<as_set>", defaults={"family": "ipv4", "le": None})',
+        '@app.route("/arista/as_set/<as_set>/le/<int:le>", defaults={"family": "ipv4"})',
+        '@app.route("/arista/as_set/<as_set>/v6", defaults={"family": "ipv6", "le": None})',
+        '@app.route("/arista/as_set/<as_set>/v6/le/<int:le>", defaults={"family": "ipv6"})',
+        '@app.route("/arista/asn/<asn>", defaults={"family": "ipv4", "le": None})',
+        '@app.route("/arista/asn/<asn>/le/<int:le>", defaults={"family": "ipv4"})',
+        '@app.route("/arista/asn/<asn>/v6", defaults={"family": "ipv6", "le": None})',
+        '@app.route("/arista/asn/<asn>/v6/le/<int:le>", defaults={"family": "ipv6"})',
     ]
     for r in expected_routes:
         if not case(f"route present: {r}", r in SRC):
@@ -309,10 +315,19 @@ def main() -> int:
     ):
         failures += 1
 
-    # No `request.args.get('family'` — family must come from path defaults.
+    # No `request.args` at all — family and the le override both live in the
+    # path, never the query string (zsh `?` globbing).
     if not case(
-        "no query-string family handling",
+        "no query-string handling (family and le are path segments)",
         "request.args" not in SRC,
+    ):
+        failures += 1
+
+    # Cache key must include the resolved max_len, or /le/32 and the default
+    # would share (and cross-poison) an entry.
+    if not case(
+        "cache key includes max_len",
+        "key = (target, family, max_len)" in SRC,
     ):
         failures += 1
 
@@ -356,6 +371,83 @@ def main() -> int:
             ok = True
         if not case(f"rejects {bad_input!r} for {family}", ok):
             failures += 1
+
+    print()
+    print("=" * 70)
+    print("8. _resolve_max_len — per-URL /le/<N> override")
+    print("=" * 70)
+
+    class _Abort(Exception):
+        def __init__(self, code, description=""):
+            self.code = code
+            self.description = description
+
+    def fake_abort(code, description=""):
+        raise _Abort(code, description)
+
+    m = re.search(r'LE_CEILING\s*=\s*(\{[^}]+\})', SRC)
+    LE_CEILING = ast.literal_eval(m.group(1))
+    if not case("LE_CEILING is {ipv4: 32, ipv6: 128}",
+                LE_CEILING == {"ipv4": 32, "ipv6": 128}):
+        failures += 1
+
+    # Simulate env defaults of 24 / 48.
+    resolve = extract_func(
+        "_resolve_max_len",
+        abort=fake_abort,
+        LE_CEILING=LE_CEILING,
+        DEFAULT_MAX_LENGTH={"ipv4": 24, "ipv6": 48},
+    )
+
+    def resolve_or_code(family, le):
+        try:
+            return resolve(family, le)
+        except _Abort as e:
+            return f"HTTP {e.code}"
+
+    table = [
+        # (family, le, expected)
+        ("ipv4", None, 24),          # no override -> env default
+        ("ipv6", None, 48),
+        ("ipv4", 32, 32),            # the PNI /26-needs-/32 case
+        ("ipv4", 26, 26),
+        ("ipv4", 1, 1),
+        ("ipv6", 128, 128),
+        ("ipv6", 64, 64),
+        ("ipv4", 0, None),           # 0 -> omit -R (exact only)
+        ("ipv6", 0, None),
+        ("ipv4", 33, "HTTP 400"),    # past the v4 ceiling
+        ("ipv6", 129, "HTTP 400"),
+        ("ipv4", -1, "HTTP 400"),
+        ("ipv4", 128, "HTTP 400"),   # v6 ceiling doesn't leak into v4
+    ]
+    for family, le, want in table:
+        got = resolve_or_code(family, le)
+        if not case(f"{family} le={le!r} -> {want!r}", got == want, f"got {got!r}"):
+            failures += 1
+
+    # Env default of "no -R" (None) with no override stays None.
+    resolve_none = extract_func(
+        "_resolve_max_len",
+        abort=fake_abort,
+        LE_CEILING=LE_CEILING,
+        DEFAULT_MAX_LENGTH={"ipv4": None, "ipv6": None},
+    )
+    if not case("env default None + no override -> None",
+                resolve_none("ipv4", None) is None):
+        failures += 1
+    if not case("env default None + /le/32 -> 32",
+                resolve_none("ipv4", 32) == 32):
+        failures += 1
+
+    # Command construction with an override: the resolved value lands in -R.
+    cmd = build_cmd("AS6939", "ipv4", max_len_v4=resolve("ipv4", 32))
+    expect = ["bgpq4", "-4", "-l", PL_NAME, "-A", "-R", "32", "AS6939"]
+    if not case("override 32 -> `-R 32` in cmd", cmd == expect, " ".join(cmd)):
+        failures += 1
+    cmd = build_cmd("AS6939", "ipv4", max_len_v4=resolve("ipv4", 0))
+    if not case("override 0 -> no -R in cmd", "-R" not in cmd, " ".join(cmd)):
+        failures += 1
 
     print()
     print("=" * 70)

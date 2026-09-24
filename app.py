@@ -8,6 +8,12 @@ Returns plain-text Arista EOS prefix-list *body* suitable for use with:
     ip   prefix-list NAME source http:<host>:<port>/arista/asn/<asn>
     ipv6 prefix-list NAME source http:<host>:<port>/arista/asn/<asn>/v6
 
+Any of those may take a trailing `/le/<N>` to override the more-specifics
+allowance (bgpq4 -R) for that one list, e.g.:
+
+    ip   prefix-list NAME source http:<host>:<port>/arista/as_set/<as-set>/le/32
+    ipv6 prefix-list NAME source http:<host>:<port>/arista/asn/<asn>/v6/le/128
+
 (note the Arista CLI quirk — `http:` with a single colon, not `http://`).
 
 When Arista sources a prefix-list over HTTP, the switch already knows the
@@ -27,6 +33,11 @@ Two endpoint shapes are exposed:
 Both default to IPv4. Append `/v6` to either path for IPv6. (We bake the
 family into the path rather than a query string so the URL is zsh-safe;
 `?` is a glob character there and trips users up.)
+
+Append `/le/<N>` (after the optional `/v6`) to accept more-specifics up to
+/N for that list only, overriding BGPQ4_MAX_LENGTH_V4 / _V6. Without it the
+env-var default applies. This is how you carve out a PNI that needs to send
+you a /26 without loosening the default policy for everyone else.
 """
 
 import os
@@ -58,6 +69,11 @@ BGPQ4_BIN = os.environ.get("BGPQ4_BIN", "bgpq4")
 BGPQ4_TIMEOUT = int(os.environ.get("BGPQ4_TIMEOUT", "60"))
 
 
+# Longest prefix length that makes sense per family. Bounds both the env-var
+# defaults and the per-URL `/le/<N>` override.
+LE_CEILING = {"ipv4": 32, "ipv6": 128}
+
+
 def _parse_max_len(raw: str, family_label: str, valid_max: int):
     """Validate BGPQ4_MAX_LENGTH_* env vars. Empty/'0' -> None (omit -R)."""
     raw = (raw or "").strip()
@@ -80,8 +96,9 @@ def _parse_max_len(raw: str, family_label: str, valid_max: int):
 # into `le N` form, so on an aggregated v4 list `-R 24` permits anything from
 # the aggregate up to /24 — the usual policy for peer prefix-lists. Set the
 # env var to empty or "0" to omit -R and use bgpq4's default (no le clause).
-MAX_LENGTH_V4 = _parse_max_len(os.environ.get("BGPQ4_MAX_LENGTH_V4", "24"), "V4", 32)
-MAX_LENGTH_V6 = _parse_max_len(os.environ.get("BGPQ4_MAX_LENGTH_V6", "48"), "V6", 128)
+MAX_LENGTH_V4 = _parse_max_len(os.environ.get("BGPQ4_MAX_LENGTH_V4", "24"), "V4", LE_CEILING["ipv4"])
+MAX_LENGTH_V6 = _parse_max_len(os.environ.get("BGPQ4_MAX_LENGTH_V6", "48"), "V6", LE_CEILING["ipv6"])
+DEFAULT_MAX_LENGTH = {"ipv4": MAX_LENGTH_V4, "ipv6": MAX_LENGTH_V6}
 
 # Logging
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -126,13 +143,32 @@ def _normalize_asn(raw: str) -> str | None:
     return f"AS{n}"
 
 
+def _resolve_max_len(family: str, le: int | None) -> int | None:
+    """Pick the bgpq4 -R value for a request.
+
+    `le` is the `/le/<N>` path override (None when absent). Returns the value
+    to pass to -R, or None to omit -R entirely. Aborts 400 on an out-of-range
+    override.
+
+    Semantics mirror the env vars: 0 means "no -R" (exact route objects only,
+    no more-specifics allowance); 1..32 (v4) / 1..128 (v6) sets the allowance.
+    """
+    if le is None:
+        return DEFAULT_MAX_LENGTH[family]
+    ceiling = LE_CEILING[family]
+    if le == 0:
+        return None
+    if le < 1 or le > ceiling:
+        abort(400, description=f"le must be 0..{ceiling} for {family}, got {le}")
+    return le
+
+
 # ---- bgpq4 invocation --------------------------------------------------------
 
-def _run_bgpq4(target: str, family: str) -> str:
+def _run_bgpq4(target: str, family: str, max_len: int | None) -> str:
     cmd = [BGPQ4_BIN, FAMILY_FLAGS[family], "-l", BGPQ4_LIST_NAME]
     if AGGREGATE:
         cmd.append("-A")
-    max_len = MAX_LENGTH_V4 if family == "ipv4" else MAX_LENGTH_V6
     if max_len is not None:
         cmd.extend(["-R", str(max_len)])
     if IRR_HOST:
@@ -204,15 +240,18 @@ def _arista_format(raw: str, family: str) -> str:
     return "\n".join(out) + ("\n" if out else "")
 
 
-def _get_prefix_list(target: str, family: str) -> str:
-    key = (target, family)
+def _get_prefix_list(target: str, family: str, le: int | None) -> str:
+    max_len = _resolve_max_len(family, le)
+    # max_len is part of the key: the same AS-SET fetched with /le/32 must not
+    # serve (or poison) the default-policy entry.
+    key = (target, family, max_len)
     with _cache_lock:
         cached = _cache.get(key)
     if cached is not None:
         log.debug("cache hit %s", key)
         return cached
 
-    raw = _run_bgpq4(target, family)
+    raw = _run_bgpq4(target, family, max_len)
     output = _arista_format(raw, family)
     with _cache_lock:
         _cache[key] = output
@@ -222,27 +261,36 @@ def _get_prefix_list(target: str, family: str) -> str:
 # ---- Routes ------------------------------------------------------------------
 
 # Two endpoint families:
-#   /arista/as_set/<as-set>[/v6]   — expand an AS-SET via IRR
-#   /arista/asn/<asn>[/v6]         — prefixes originated by a single ASN
+#   /arista/as_set/<as-set>[/v6][/le/<N>]   — expand an AS-SET via IRR
+#   /arista/asn/<asn>[/v6][/le/<N>]         — prefixes originated by a single ASN
 #
 # IPv4 is the default at the base path; the `/v6` suffix flips to IPv6.
+# The optional `/le/<N>` suffix overrides the more-specifics allowance
+# (bgpq4 -R) for that list only. It's a path segment, not a query string,
+# for the same zsh-safety reason as the family. `<int:le>` means a
+# non-numeric value 404s before reaching the handler; range is checked in
+# _resolve_max_len.
 
-@app.route("/arista/as_set/<as_set>", defaults={"family": "ipv4"})
-@app.route("/arista/as_set/<as_set>/v6", defaults={"family": "ipv6"})
-def arista_as_set(as_set: str, family: str):
+@app.route("/arista/as_set/<as_set>", defaults={"family": "ipv4", "le": None})
+@app.route("/arista/as_set/<as_set>/le/<int:le>", defaults={"family": "ipv4"})
+@app.route("/arista/as_set/<as_set>/v6", defaults={"family": "ipv6", "le": None})
+@app.route("/arista/as_set/<as_set>/v6/le/<int:le>", defaults={"family": "ipv6"})
+def arista_as_set(as_set: str, family: str, le: int | None):
     if not AS_RE.match(as_set):
         abort(400, description="invalid AS-SET / AS object")
-    body = _get_prefix_list(as_set, family)
+    body = _get_prefix_list(as_set, family, le)
     return Response(body, mimetype="text/plain")
 
 
-@app.route("/arista/asn/<asn>", defaults={"family": "ipv4"})
-@app.route("/arista/asn/<asn>/v6", defaults={"family": "ipv6"})
-def arista_asn(asn: str, family: str):
+@app.route("/arista/asn/<asn>", defaults={"family": "ipv4", "le": None})
+@app.route("/arista/asn/<asn>/le/<int:le>", defaults={"family": "ipv4"})
+@app.route("/arista/asn/<asn>/v6", defaults={"family": "ipv6", "le": None})
+@app.route("/arista/asn/<asn>/v6/le/<int:le>", defaults={"family": "ipv6"})
+def arista_asn(asn: str, family: str, le: int | None):
     normalized = _normalize_asn(asn)
     if normalized is None:
         abort(400, description="invalid ASN (expected 1..4294967295, optionally AS-prefixed)")
-    body = _get_prefix_list(normalized, family)
+    body = _get_prefix_list(normalized, family, le)
     return Response(body, mimetype="text/plain")
 
 
@@ -266,11 +314,17 @@ def index():
         "  GET /arista/asn/<asn>/v6             (IPv6)\n"
         "  GET /health\n"
         "\n"
+        "Append /le/<N> to any list URL to accept more-specifics up to /N\n"
+        "for that list only (overrides the BGPQ4_MAX_LENGTH_* default).\n"
+        f"  v4: 0..{LE_CEILING['ipv4']}   v6: 0..{LE_CEILING['ipv6']}   (0 = exact route objects only, no le clause)\n"
+        "\n"
         "Examples:\n"
         "  curl http://localhost:8080/arista/as_set/AS-HURRICANE\n"
         "  curl http://localhost:8080/arista/as_set/AS-HURRICANE/v6\n"
         "  curl http://localhost:8080/arista/asn/AS6939\n"
-        "  curl http://localhost:8080/arista/asn/6939/v6\n",
+        "  curl http://localhost:8080/arista/asn/6939/v6\n"
+        "  curl http://localhost:8080/arista/asn/AS6939/le/32       (PNI: allow up to /32)\n"
+        "  curl http://localhost:8080/arista/as_set/AS-FOO/v6/le/128\n",
         mimetype="text/plain",
     )
 
